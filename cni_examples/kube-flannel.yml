@@ -1,0 +1,223 @@
+---
+# Creates a namespace for Flannel resources
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: kube-flannel
+  labels:
+    k8s-app: flannel
+    pod-security.kubernetes.io/enforce: privileged
+---
+# Defines a ClusterRole for Flannel with permissions to interact with Kubernetes resources
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  labels:
+    k8s-app: flannel
+  name: flannel
+rules:
+  - apiGroups:
+      - "" # Refers to the core API group
+    resources:
+      - pods
+    verbs:
+      - get # Allows Flannel to get pod information
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch # Allows Flannel to monitor node changes
+  - apiGroups:
+      - ""
+    resources:
+      - nodes/status
+    verbs:
+      - patch # Allows Flannel to update node statuses
+---
+# Binds the ClusterRole to the Flannel ServiceAccount
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  labels:
+    k8s-app: flannel
+  name: flannel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: flannel
+subjects:
+  - kind: ServiceAccount
+    name: flannel
+    namespace: kube-flannel
+---
+# Creates a ServiceAccount for Flannel in the kube-flannel namespace
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    k8s-app: flannel
+  name: flannel
+  namespace: kube-flannel
+---
+# ConfigMap to store Flannel's configuration
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: kube-flannel-cfg
+  namespace: kube-flannel
+  labels:
+    tier: node
+    k8s-app: flannel
+    app: flannel
+data:
+  # CNI plugin configuration
+  cni-conf.json: |
+    {
+      "name": "cbr0",
+      "cniVersion": "0.3.1",
+      "plugins": [
+        {
+          "type": "flannel", # Specifies the Flannel CNI plugin
+          "delegate": {
+            "hairpinMode": true,
+            "isDefaultGateway": true
+          }
+        },
+        {
+          "type": "portmap", # Enables port mapping for pods
+          "capabilities": {
+            "portMappings": true
+          }
+        }
+      ]
+    }
+  # Flannel network configuration
+  net-conf.json: |
+    {
+      "Network": "10.244.0.0/16", # Defines the pod network CIDR
+      "EnableNFTables": false,
+      "Backend": {
+        "Type": "vxlan" # Specifies the VXLAN backend for Flannel
+      }
+    }
+---
+# Deploys Flannel as a DaemonSet to ensure it runs on all nodes
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-flannel-ds
+  namespace: kube-flannel
+  labels:
+    tier: node
+    app: flannel
+    k8s-app: flannel
+spec:
+  selector:
+    matchLabels:
+      app: flannel
+  template:
+    metadata:
+      labels:
+        tier: node
+        app: flannel
+    spec:
+      # Ensures Flannel runs only on Linux nodes
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values:
+                      - linux
+      hostNetwork: true # Allows Flannel to use the host network namespace
+      priorityClassName: system-node-critical # Ensures high priority for Flannel pods
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule # Allows Flannel to run on tainted nodes
+      serviceAccountName: flannel # Uses the Flannel ServiceAccount
+      initContainers:
+        # Installs the Flannel CNI plugin
+        - name: install-cni-plugin
+          image: ghcr.io/flannel-io/flannel-cni-plugin:v1.7.1-flannel1
+          command:
+            - cp
+          args:
+            - -f
+            - /flannel
+            - /opt/cni/bin/flannel
+          volumeMounts:
+            - name: cni-plugin
+              mountPath: /opt/cni/bin
+        # Configures the CNI network settings
+        - name: install-cni
+          image: ghcr.io/flannel-io/flannel:v0.27.3
+          command:
+            - cp
+          args:
+            - -f
+            - /etc/kube-flannel/cni-conf.json
+            - /etc/cni/net.d/10-flannel.conflist
+          volumeMounts:
+            - name: cni
+              mountPath: /etc/cni/net.d
+            - name: flannel-cfg
+              mountPath: /etc/kube-flannel/
+      containers:
+        # Runs the Flannel daemon
+        - name: kube-flannel
+          image: ghcr.io/flannel-io/flannel:v0.27.3
+          command:
+            - /opt/bin/flanneld
+          args:
+            - --ip-masq # Enables IP masquerading
+            - --kube-subnet-mgr # Uses Kubernetes to manage subnets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "50Mi"
+          securityContext:
+            privileged: false
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"] # Grants network-related capabilities
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: EVENT_QUEUE_DEPTH
+              value: "5000"
+            - name: CONT_WHEN_CACHE_NOT_READY
+              value: "false"
+          volumeMounts:
+            - name: run
+              mountPath: /run/flannel
+            - name: flannel-cfg
+              mountPath: /etc/kube-flannel/
+            - name: xtables-lock
+              mountPath: /run/xtables.lock
+      volumes:
+        - name: run
+          hostPath:
+            path: /run/flannel
+        - name: cni-plugin
+          hostPath:
+            path: /opt/cni/bin
+        - name: cni
+          hostPath:
+            path: /etc/cni/net.d
+        - name: flannel-cfg
+          configMap:
+            name: kube-flannel-cfg # Mounts the ConfigMap as a volume
+        - name: xtables-lock
+          hostPath:
+            path: /run/xtables.lock
+            type: FileOrCreate # Creates the file if it doesn't exist
