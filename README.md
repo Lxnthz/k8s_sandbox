@@ -392,8 +392,191 @@ Kalau keluar versi (misal `v1.30.x`), artinya sukses ✅
 
 * Semua node punya `kubeadm`, `kubelet`, `kubectl`.
 * Cluster siap untuk **initialization** di master node.
+---
+
+# 🔹 Step 5 — Initialize Control Plane
+
+## 1. Jalankan `kubeadm init`
+
+Hanya di **master node**:
+
+```bash
+sudo kubeadm init --pod-network-cidr=10.244.0.0/16
+```
+
+### ✨ Penjelasan:
+
+* `--pod-network-cidr=10.244.0.0/16` → ini CIDR default untuk **Flannel CNI**.
+  Jika nanti pakai **Calico**, bisa pakai `192.168.0.0/16`.
+* Saat command ini dijalankan:
+
+  * `etcd` (database cluster) akan dibuat.
+  * `kube-apiserver` (API utama cluster) aktif.
+  * `kube-scheduler` dan `kube-controller-manager` jalan.
+  * `kubelet` di master akan otomatis join.
+
+Output akhirnya akan menampilkan sesuatu seperti:
+
+```
+Your Kubernetes control-plane has initialized successfully!
+
+To start using your cluster, you need to run the following as a regular user:
+
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+You should now deploy a pod network to the cluster.
+...
+
+Then you can join any number of worker nodes by running the following on each as root:
+
+  kubeadm join 192.168.10.100:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>
+```
 
 ---
+
+## 2. Konfigurasi `kubectl` di Master
+
+Supaya bisa pakai `kubectl` tanpa root:
+
+```bash
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+```
+
+Tes koneksi cluster:
+
+```bash
+kubectl get nodes
+```
+
+Output awal biasanya hanya ada `master-node` dengan status `NotReady` (karena CNI belum diinstall → lanjut Step 6).
+
+---
+
+## 3. (Opsional) Izinkan Master Node Jalankan Workload
+
+Secara default, master diberi **taint** supaya tidak dipakai untuk workload.
+Kalau kamu ingin master juga bisa jalanin pod (karena resource terbatas di VM demo):
+
+```bash
+kubectl taint nodes master-node node-role.kubernetes.io/control-plane:NoSchedule-
+```
+
+👉 Analogi: taint itu kayak **policy di vSphere DRS** yang melarang VM ditempatkan di host tertentu. Kita bisa cabut kalau host mau ikut dipakai.
+
+---
+
+## 🔎 Troubleshooting
+
+* **Error: swap is on** → balik ke Step 1, pastikan swap sudah off.
+* **Error: ports 6443, 10250 already in use** → mungkin ada kubeadm init gagal sebelumnya → reset dengan:
+
+  ```bash
+  sudo kubeadm reset -f
+  sudo systemctl restart kubelet
+  ```
+* **Master tetap NotReady** → normal sebelum install CNI (lanjut Step 6).
+
+---
+
+✅ Setelah Step 5 ini:
+
+* Control plane aktif.
+* Master node sudah terdaftar di cluster.
+* Cluster menunggu CNI agar siap pakai.
+---
+
+# 🔹 Step 6 — Install Pod Network (CNI)
+
+## 1. Konsep Dasar CNI
+
+* **CNI (Container Network Interface)** = plugin yang mengatur jaringan antar-pod dan antar-node.
+* Tanpa CNI → pod hanya “jalan” tapi tidak bisa komunikasi.
+* Beberapa pilihan populer:
+
+  * **Flannel** → ringan, cocok untuk lab/demo.
+  * **Calico** → lebih lengkap (network policy, BGP), tapi lebih berat.
+
+👉 Untuk simulasi ringan (seperti skenario 2–3 VM), **Flannel** lebih tepat.
+
+---
+
+## 2. Install Flannel
+
+Jalankan di **master node**:
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+```
+
+Ini akan membuat:
+
+* DaemonSet Flannel di semua node.
+* Pod networking `10.244.0.0/16` (sesuai `--pod-network-cidr` di Step 5).
+
+---
+
+## 3. Verifikasi CNI
+
+Cek apakah pods Flannel berjalan:
+
+```bash
+kubectl get pods -n kube-flannel
+```
+
+Harusnya status = `Running`.
+
+Cek node status:
+
+```bash
+kubectl get nodes
+```
+
+Kalau berhasil, node master berubah dari `NotReady` → `Ready`.
+
+---
+
+## 4. Alternatif: Install Calico
+
+Kalau ingin coba network policy lebih realistis:
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.2/manifests/calico.yaml
+```
+
+📌 Tapi ingat:
+
+* `--pod-network-cidr` saat `kubeadm init` harus `192.168.0.0/16`.
+* Resource usage lebih besar dibanding Flannel.
+
+---
+
+## 🔎 Troubleshooting
+
+* **Node tetap NotReady** → biasanya karena:
+
+  * `--pod-network-cidr` salah (misalnya pakai Calico tapi init pakai Flannel CIDR).
+  * Modul kernel `br_netfilter` belum aktif (cek Step 2).
+* **Flannel pod CrashLoopBackOff** → cek log:
+
+  ```bash
+  kubectl logs -n kube-flannel <nama-pod>
+  ```
+* **Ping antar pod gagal** → pastikan iptables aktif dan tidak diblok firewall VM host.
+
+---
+
+✅ Setelah Step 6 ini:
+
+* Cluster sudah punya jaringan pod.
+* Master node `Ready` → siap menerima workload.
+* Worker node bisa join dengan lancar (Step 7).
+
+---
+
 
 
 
