@@ -577,6 +577,366 @@ kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.2/
 
 ---
 
+# 🔹 Step 7 — Join Worker Node
+
+## 1. Dapatkan Join Command di Master
+
+Di **master node**, jalankan:
+
+```bash
+kubeadm token create --print-join-command
+```
+
+Output contoh:
+
+```bash
+kubeadm join 192.168.10.100:6443 --token abcdef.0123456789abcdef \
+  --discovery-token-ca-cert-hash sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+```
+
+### ✨ Penjelasan:
+
+* `192.168.10.100:6443` → IP master + port API server.
+* `--token` → satu kali token untuk join (berlaku default 24 jam).
+* `--discovery-token-ca-cert-hash` → memastikan worker memverifikasi sertifikat TLS master.
+
+---
+
+## 2. Jalankan Join di Worker Node
+
+Di setiap **worker node**, jalankan command yang didapat dari master:
+
+```bash
+sudo kubeadm join 192.168.10.100:6443 --token abcdef.0123456789abcdef \
+  --discovery-token-ca-cert-hash sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+```
+
+Jika berhasil, outputnya mirip:
+
+```
+This node has joined the cluster:
+* Certificate signing request sent to API server and approved.
+* Kubelet started.
+* etc.
+```
+
+---
+
+## 3. Verifikasi di Master
+
+Di **master node**, cek status semua node:
+
+```bash
+kubectl get nodes
+```
+
+Output contoh:
+
+```
+NAME           STATUS   ROLES           AGE   VERSION
+master-node    Ready    control-plane   5m    v1.30.0
+worker-node1   Ready    <none>          1m    v1.30.0
+worker-node2   Ready    <none>          1m    v1.30.0
+```
+
+✅ Semua node `Ready` → cluster siap untuk workload.
+
+---
+
+## 🔎 Troubleshooting
+
+* **Node stuck `NotReady`**:
+
+  * Cek CNI sudah terinstall & berjalan (`kubectl get pods -n kube-flannel`).
+  * Cek koneksi jaringan (ping master dari worker).
+  * Pastikan waktu node sinkron (`chrony` atau `ntp`).
+* **Token expired** → buat token baru di master:
+
+  ```bash
+  kubeadm token create --print-join-command
+  ```
+* **Error CA certificate** → periksa hash di `--discovery-token-ca-cert-hash`.
+
+---
+
+✅ Setelah Step 7 ini:
+
+* Semua worker sudah tergabung.
+* Cluster siap deployment.
+* Node master juga bisa digunakan untuk workload jika di-untaint (Step 5).
+
+---
+
+# 🔹 Step 8 — Verification & First Deployment
+
+## 1. Verifikasi Cluster Health
+
+Di **master node**, jalankan:
+
+```bash
+# Cek semua node
+kubectl get nodes
+
+# Cek semua pods sistem di namespace kube-system
+kubectl get pods -n kube-system
+```
+
+✅ Node harus `Ready`, pod CNI (Flannel) harus `Running`.
+
+---
+
+## 2. Deploy Aplikasi Sederhana (NGINX)
+
+Buat file YAML `nginx-deployment.yaml`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-demo
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+```
+
+Deskripsi YAML:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-production
+  namespace: production
+  labels:
+    app: nginx
+spec:
+  replicas: 3  # Deployment produksi biasanya minimal 3 pod untuk HA
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      # ---------------------------
+      # Node Scheduling Controls
+      # ---------------------------
+      # NodeSelector → membatasi pod hanya di node tertentu (misal worker nodes)
+      nodeSelector:
+        node-role.kubernetes.io/worker: "true"
+
+      # Affinity → aturan kompleks untuk penjadwalan
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - nginx
+              topologyKey: "kubernetes.io/hostname"
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - worker-node1
+                      - worker-node2
+
+      # Tolerations → agar pod bisa berjalan di node yang memiliki taint tertentu
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      # ---------------------------
+      # Pod-level Security Context
+      # ---------------------------
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 3000
+        fsGroup: 2000
+
+      # ---------------------------
+      # Volumes
+      # ---------------------------
+      volumes:
+        - name: nginx-html
+          emptyDir: {}  # simulasi temporary storage untuk web content
+
+      # ---------------------------
+      # Container Definition
+      # ---------------------------
+      containers:
+      - name: nginx
+        image: nginx:stable-alpine
+        ports:
+        - containerPort: 80
+
+        # Mount volume
+        volumeMounts:
+          - name: nginx-html
+            mountPath: /usr/share/nginx/html
+
+        # ---------------------------
+        # Resource Management
+        # ---------------------------
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "500m"
+          limits:
+            memory: "256Mi"
+            cpu: "1"
+
+        # ---------------------------
+        # Liveness & Readiness Probes
+        # ---------------------------
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 3
+
+        # ---------------------------
+        # Environment Variables
+        # ---------------------------
+        env:
+          - name: ENVIRONMENT
+            value: "production"
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+
+        # ---------------------------
+        # Security Context for Container
+        # ---------------------------
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+
+      # ---------------------------
+      # Optional: Host Networking
+      # ---------------------------
+      # hostNetwork: false  # Biasanya false di produksi kecuali memang butuh
+```
+
+Jalankan deploy:
+
+```bash
+kubectl apply -f nginx-deployment.yaml
+```
+
+---
+
+## 3. Verifikasi Deployment
+
+```bash
+kubectl get deployments
+kubectl get pods -o wide
+```
+
+### ✨ Penjelasan:
+
+* **Deployment** → mengatur jumlah replika pod, update otomatis, rollback.
+* **ReplicaSet** → secara internal memastikan jumlah pod sesuai deployment.
+* **Pod** → unit terkecil Kubernetes, mirip VM ringan.
+
+Cek distribusi pod: pod harus tersebar di worker-node1 & worker-node2 (kecuali master di-untaint, bisa ikut).
+
+---
+
+## 4. Expose Deployment
+
+### ClusterIP Service (default)
+
+```bash
+kubectl expose deployment nginx-demo --port=80 --target-port=80 --name=nginx-service
+kubectl get svc
+```
+
+* **ClusterIP** → hanya bisa diakses dari dalam cluster.
+* Tes dari pod lain:
+
+```bash
+kubectl run curlpod --image=alpine --rm -it -- sh
+# di dalam pod
+apk add --no-cache curl
+curl nginx-service
+```
+
+### NodePort Service (akses dari host)
+
+```bash
+kubectl expose deployment nginx-demo --type=NodePort --port=80
+kubectl get svc
+```
+
+* Catat `NODEPORT` (misal 30007).
+* Akses dari Windows host / browser:
+
+```
+http://192.168.10.100:30007
+```
+
+---
+
+## 5. Troubleshooting
+
+* **Pod CrashLoopBackOff** → cek log:
+
+```bash
+kubectl logs <pod-name>
+```
+
+* **Service tidak reachable** → cek:
+
+  * Pod status `Running`
+  * Pod di node yang berbeda bisa ping satu sama lain (`kubectl exec -it <pod> -- ping <pod-ip>`).
+  * CNI Flannel berjalan dengan benar.
+
+---
+
+✅ Setelah Step 8 ini:
+
+* Cluster sudah **fully functional**.
+* Pod bisa berjalan di beberapa node.
+* Deployment & Service sudah bisa dicontohkan ke tim.
+* Siap untuk uji *scheduling*, *resiliency*, dan *scaling* ringan.
+
+---
+
+
+
 
 
 
